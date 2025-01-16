@@ -9,12 +9,6 @@ Custom font and font size for image captions
 Proper handling of multiple images per page
 Timestamp-based image sorting
 
-Remember that you need:
-
-A LaTeX distribution with XeLaTeX installed
-The fontspec and caption LaTeX packages
-The specified font (Arial or other) installed on your system
-
 python latex-picture-book.py --image-directory ./images --output-directory ./output \
     --document-name photobook --page-size legal --orientation landscape
 """
@@ -32,23 +26,98 @@ def get_image_creation_time(filepath):
 
 def escape_latex_filename(filename):
     """Escape special characters in filenames for LaTeX."""
-    # Replace underscores with escaped underscores
     filename = filename.replace('_', '\\_')
-    # Escape other special characters if needed
     special_chars = ['&', '%', '$', '#', '{', '}', '~', '^']
     for char in special_chars:
         filename = filename.replace(char, f'\\{char}')
     return filename
 
 
-def create_latex_picture_book(image_dir, output_dir, doc_name, image_dpi=300,
-                              font_size=8, page_size="letter", orientation="portrait"):
-    """Creates a LaTeX picture book from images in a directory."""
+def get_image_dimensions_in_inches(image_path, usable_width, usable_height, scaling_factor):
+    """Get image dimensions in inches, applying scaling factor and page constraints."""
+    with Image.open(image_path) as img:
+        # Use a default DPI of 96 for sizing
+        base_dpi = 96
 
+        # Convert pixels to inches at base DPI and apply scaling factor
+        width_in = (img.width / base_dpi) * scaling_factor
+        height_in = (img.height / base_dpi) * scaling_factor
+
+        # Scale down further if image is still larger than page
+        if width_in > usable_width or height_in > usable_height:
+            width_scale = usable_width / width_in
+            height_scale = usable_height / height_in
+            scale = min(width_scale, height_scale) * 0.95  # Add 5% margin for safety
+
+            width_in *= scale
+            height_in *= scale
+
+        return width_in, height_in
+
+
+def calculate_page_dimensions(page_size, orientation):
+    """Calculate usable page dimensions in inches, accounting for margins."""
+    margins = 0.5  # 0.5 inch margins
+
+    if page_size.lower() == 'letter':
+        width, height = (11, 8.5) if orientation == 'landscape' else (8.5, 11)
+    elif page_size.lower() == 'a4':
+        width, height = (11.69, 8.27) if orientation == 'landscape' else (8.27, 11.69)
+    elif page_size.lower() == 'legal':
+        width, height = (14, 8.5) if orientation == 'landscape' else (8.5, 14)
+
+    # Account for margins
+    usable_width = width - (2 * margins)
+    usable_height = height - (2 * margins)
+
+    return usable_width, usable_height
+
+
+def group_images_for_pages(image_files, image_dir, usable_width, usable_height, scaling_factor):
+    """Group images that can fit together on the same page."""
+    pages = []
+    current_page = []
+    current_y = 0
+    max_spacing = 0.3  # inches between images
+
+    for filename, _ in image_files:
+        filepath = os.path.join(image_dir, filename)
+        img_width, img_height = get_image_dimensions_in_inches(filepath, usable_width, usable_height, scaling_factor)
+
+        # If this is the first image on the page or it fits with existing images
+        if not current_page or (current_y + img_height + max_spacing <= usable_height):
+            current_page.append({
+                'filename': filename,
+                'width': img_width,
+                'height': img_height
+            })
+            current_y += img_height + max_spacing
+        else:
+            # Start new page
+            pages.append(current_page)
+            current_page = [{
+                'filename': filename,
+                'width': img_width,
+                'height': img_height
+            }]
+            current_y = img_height + max_spacing
+
+    if current_page:
+        pages.append(current_page)
+
+    return pages
+
+
+def create_latex_picture_book(image_dir, output_dir, doc_name, page_size="letter", orientation="portrait",
+                              scaling_factor=0.50):
+    """Creates a LaTeX picture book from images in a directory."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     output_file = os.path.join(output_dir, f"{doc_name}.tex")
+
+    # Get usable page dimensions
+    usable_width, usable_height = calculate_page_dimensions(page_size, orientation)
 
     # Get list of image files sorted by timestamp
     image_files = []
@@ -59,12 +128,16 @@ def create_latex_picture_book(image_dir, output_dir, doc_name, image_dpi=300,
 
     image_files.sort(key=lambda x: x[1])  # Sort by timestamp
 
+    # Group images into pages
+    pages = group_images_for_pages(image_files, image_dir, usable_width, usable_height, scaling_factor)
+
     with open(output_file, "w") as f:
-        # Document preamble with minimal packages
+        # Document preamble
         f.write("\\documentclass{article}\n")
         f.write("\\usepackage{graphicx}\n")
         f.write("\\usepackage[utf8]{inputenc}\n")
         f.write("\\usepackage[margin=0.5in]{geometry}\n")
+        f.write("\\usepackage{float}\n")
 
         # Set page size and orientation
         if orientation.lower() == 'landscape':
@@ -84,20 +157,25 @@ def create_latex_picture_book(image_dir, output_dir, doc_name, image_dpi=300,
 
         # Set up graphics path
         f.write(f"\\graphicspath{{{{{image_dir}/}}}}\n")
-
-        # Set up basic document configuration
-        f.write("\\pagestyle{empty}\n")  # No page numbers
+        f.write("\\pagestyle{empty}\n")
 
         f.write("\\begin{document}\n")
 
-        # Process each image
-        for filename, _ in image_files:
-            escaped_filename = escape_latex_filename(filename)
+        # Process each page of images
+        for page in pages:
             f.write("\\begin{center}\n")
-            f.write(
-                f"\\includegraphics[width=0.95\\textwidth,height=0.95\\textheight,keepaspectratio]{{{filename}}}\n\n")
-            f.write(f"\\vspace{{0.1in}}\n")
-            f.write(f"\\texttt{{\\small {escaped_filename}}}\n")
+
+            for img in page:
+                filename = img['filename']
+                escaped_filename = escape_latex_filename(filename)
+
+                # Create a figure environment for each image and its caption
+                f.write("\\begin{figure}[H]\n")
+                f.write("\\centering\n")
+                f.write(f"\\includegraphics[width={img['width']}in,height={img['height']}in]{{{filename}}}\n")
+                f.write(f"\\caption*{{\\texttt{{\\small {escaped_filename}}}}}\n")
+                f.write("\\end{figure}\n\n")
+
             f.write("\\end{center}\n")
             f.write("\\clearpage\n\n")
 
@@ -133,27 +211,30 @@ def main():
     parser.add_argument('--image-directory', required=True, help='Directory containing images')
     parser.add_argument('--output-directory', required=True, help='Output directory for LaTeX and PDF files')
     parser.add_argument('--document-name', required=True, help='Name of the output document (without extension)')
-    parser.add_argument('--image-dpi', type=int, default=300, help='Image DPI (default: 300)')
     parser.add_argument('--no-pdf', action='store_true', help='Skip PDF generation')
-    parser.add_argument('--image-name-font-size', type=int, default=8,
-                        help='Font size for image names in points (default: 8)')
     parser.add_argument('--page-size', default='letter',
                         choices=['letter', 'a4', 'legal'],
                         help='Page size (default: letter)')
     parser.add_argument('--orientation', default='portrait',
                         choices=['portrait', 'landscape'],
                         help='Page orientation (default: portrait)')
+    parser.add_argument('--image-scaling-factor', type=float, default=0.50,
+                        help='Scale factor for images (default: 0.50, range: 0.1-1.0)')
 
     args = parser.parse_args()
+
+    # Validate scaling factor
+    if args.image_scaling_factor < 0.1 or args.image_scaling_factor > 1.0:
+        print("Warning: Scaling factor should be between 0.1 and 1.0. Using default value of 0.50")
+        args.image_scaling_factor = 0.50
 
     tex_file = create_latex_picture_book(
         args.image_directory,
         args.output_directory,
         args.document_name,
-        args.image_dpi,
-        args.image_name_font_size,
         args.page_size,
-        args.orientation
+        args.orientation,
+        args.image_scaling_factor
     )
 
     if not args.no_pdf:
